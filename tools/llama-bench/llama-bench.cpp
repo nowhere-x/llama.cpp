@@ -24,6 +24,119 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include <papi.h>
+
+struct PapiMetrics {
+    long long cycles = 0;
+    long long instructions = 0;
+    long long cache_misses = 0;
+    long long calls = 0;
+};
+
+class PapiState {
+public:
+    int event_set = PAPI_NULL;
+    std::map<std::string, PapiMetrics> metrics_by_kernel;
+
+    PapiState() {
+        if (PAPI_library_init(PAPI_VER_CURRENT) != PAPI_VER_CURRENT) {
+            fprintf(stderr, "PAPI library init error!\n");
+            return;
+        }
+
+        if (PAPI_create_eventset(&event_set) != PAPI_OK) {
+            fprintf(stderr, "PAPI create event set error!\n");
+            event_set = PAPI_NULL;
+            return;
+        }
+
+        // Add desired events to the event set
+        if (PAPI_add_event(event_set, PAPI_TOT_CYC) != PAPI_OK ||
+            PAPI_add_event(event_set, PAPI_TOT_INS) != PAPI_OK ||
+            PAPI_add_named_event(event_set, "perf::CACHE-MISSES") != PAPI_OK) {
+            fprintf(stderr, "PAPI add event error!\n");
+            PAPI_cleanup_eventset(event_set);
+            event_set = PAPI_NULL;
+            return;
+        }
+    }
+    
+    void print_coarse_metrics(const std::string& phase_name) const {
+        // Coarse-grained profiling results
+
+        // Aggregate metrics across all kernels for the entire phase
+        long long phase_cycles = 0, phase_instructions = 0, phase_cache_misses = 0, phase_calls = 0;
+        for (const auto & [kernel, metrics] : metrics_by_kernel) {
+            phase_cycles += metrics.cycles;
+            phase_instructions += metrics.instructions;
+            phase_cache_misses += metrics.cache_misses;
+            phase_calls += metrics.calls;
+        }
+        double phase_ipc = phase_cycles > 0 ? (double) phase_instructions / phase_cycles : 0.0;
+        double phase_mpki = phase_instructions > 0 ? (double) phase_cache_misses / (phase_instructions / 1000.0) : 0.0;
+
+        fprintf(stderr, "\n=== PAPI Coarse Metrics for %s ===\n", phase_name.c_str());
+        fprintf(stderr, "Cycles: %lld | Instructions: %lld | Cache Misses: %lld | Calls: %lld\n",
+             phase_cycles, phase_instructions, phase_cache_misses, phase_calls);
+        fprintf(stderr, "IPC: %.3f | MPKI: %.3f\n", phase_ipc, phase_mpki);
+    }
+
+    void print_fine_metrics(const std::string& phase_name) const {
+        // Fine-grained profiling results
+        fprintf(stderr, "\n=== PAPI Fine Metrics for %s ===\n", phase_name.c_str());
+        fprintf(stderr, "%-20s | %-12s | %-12s | %-12s | %-8s | %-8s | %8s \n", "Kernel", "Cycles", "Instructions", "Cache Misses", "Calls", "IPC", "MPKI");
+        fprintf(stderr, "---------------------------------------------------------------------------------------------\n");
+
+        // Print metrics for each kernel
+        for (const auto & [kernel, metrics] : metrics_by_kernel) {
+            double kernel_ipc = metrics.cycles > 0 ? (double) metrics.instructions / metrics.cycles : 0.0;
+            double kernel_mpki = metrics.instructions > 0 ? (double) metrics.cache_misses / (metrics.instructions / 1000.0) : 0.0;
+
+            fprintf(stderr, "%-20s | %-12lld | %-12lld | %-12lld | %-8lld | %-8.3f | %8.3f \n",
+                 kernel.c_str(), metrics.cycles, metrics.instructions, metrics.cache_misses, metrics.calls, kernel_ipc, kernel_mpki);
+        }
+
+        fprintf(stderr, "---------------------------------------------------------------------------------------------\n");
+    }
+
+    void print_metrics_and_clean(const std::string& phase_name)  {
+        print_coarse_metrics(phase_name);
+        print_fine_metrics(phase_name);
+        metrics_by_kernel.clear();
+    }
+};
+
+static PapiState global_papi_state;
+
+static bool papi_cb_eval(struct ggml_tensor *t, bool ask, void* user_data) {
+    PapiState * state = static_cast<PapiState *>(user_data);
+
+    if (state->event_set == PAPI_NULL) {
+        return false;
+    }
+
+    if (ask) {
+        if ( ggml_is_view(t) || t->op == GGML_OP_NONE ) {
+            return false;
+        }
+
+        PAPI_start(state->event_set);
+        return true;
+    } else {
+        long long values[3] = {0};
+        PAPI_stop(state->event_set, values);
+
+        std::string kernel_name = ggml_op_name(t->op);
+        auto & metrics = state->metrics_by_kernel[kernel_name];
+        metrics.cycles += values[0];
+        metrics.instructions += values[1];
+        metrics.cache_misses += values[2];
+        metrics.calls += 1;
+
+        return true;
+    }
+}
+
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
 #    ifndef NOMINMAX
@@ -1186,6 +1299,8 @@ struct cmd_params_instance {
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
+        cparams.cb_eval         = papi_cb_eval;
+        cparams.cb_eval_user_data = &global_papi_state;
 
         return cparams;
     }
@@ -2269,6 +2384,7 @@ int main(int argc, char ** argv) {
                             i + 1, params.reps);
                 }
                 bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
+                global_papi_state.print_metrics_and_clean(std::string("Prefill"));
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt\n", __func__);
                     llama_free(ctx);
@@ -2282,6 +2398,7 @@ int main(int argc, char ** argv) {
                             i + 1, params.reps);
                 }
                 bool res = test_gen(ctx, t.n_gen, t.n_threads);
+                global_papi_state.print_metrics_and_clean(std::string("Decode"));
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run gen\n", __func__);
                     llama_free(ctx);
