@@ -5,6 +5,8 @@
 #include <cinttypes>
 #include <clocale>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +27,7 @@
 #include "llama.h"
 
 #include <papi.h>
+#include <unordered_map>
 
 struct PapiMetrics {
     long long cycles = 0;
@@ -36,7 +39,7 @@ struct PapiMetrics {
 class PapiState {
 public:
     int event_set = PAPI_NULL;
-    std::map<std::string, PapiMetrics> metrics_by_kernel;
+    std::unordered_map<std::string, PapiMetrics> metrics_by_kernel;
 
     PapiState() {
         if (PAPI_library_init(PAPI_VER_CURRENT) != PAPI_VER_CURRENT) {
@@ -84,7 +87,7 @@ public:
     void print_fine_metrics(const std::string& phase_name) const {
         // Fine-grained profiling results
         fprintf(stderr, "\n=== PAPI Fine Metrics for %s ===\n", phase_name.c_str());
-        fprintf(stderr, "%-20s | %-12s | %-12s | %-12s | %-8s | %-8s | %8s \n", "Kernel", "Cycles", "Instructions", "Cache Misses", "Calls", "IPC", "MPKI");
+        fprintf(stderr, "%-40s | %-12s | %-12s | %-12s | %-8s | %-8s | %8s \n", "Kernel", "Cycles", "Instructions", "Cache Misses", "Calls", "IPC", "MPKI");
         fprintf(stderr, "---------------------------------------------------------------------------------------------\n");
 
         // Print metrics for each kernel
@@ -92,7 +95,7 @@ public:
             double kernel_ipc = metrics.cycles > 0 ? (double) metrics.instructions / metrics.cycles : 0.0;
             double kernel_mpki = metrics.instructions > 0 ? (double) metrics.cache_misses / (metrics.instructions / 1000.0) : 0.0;
 
-            fprintf(stderr, "%-20s | %-12lld | %-12lld | %-12lld | %-8lld | %-8.3f | %8.3f \n",
+            fprintf(stderr, "%-40s | %-12lld | %-12lld | %-12lld | %-8lld | %-8.3f | %8.3f \n",
                  kernel.c_str(), metrics.cycles, metrics.instructions, metrics.cache_misses, metrics.calls, kernel_ipc, kernel_mpki);
         }
 
@@ -126,7 +129,7 @@ static bool papi_cb_eval(struct ggml_tensor *t, bool ask, void* user_data) {
         long long values[3] = {0};
         PAPI_stop(state->event_set, values);
 
-        std::string kernel_name = ggml_op_name(t->op);
+        std::string kernel_name = std::string(ggml_op_name(t->op)) + " " + std::string(t->src[0]->name);
         auto & metrics = state->metrics_by_kernel[kernel_name];
         metrics.cycles += values[0];
         metrics.instructions += values[1];
@@ -2183,6 +2186,22 @@ static std::unique_ptr<printer> create_printer(output_formats format) {
     GGML_ABORT("fatal error");
 }
 
+static void print_phase_memory_and_time(struct llama_context * ctx, const char * phase,
+                                         uint64_t elapsed_ns, int n_tokens) {
+    // memory info
+    size_t state_bytes = llama_state_get_size(ctx);
+    size_t kv_bytes = llama_state_seq_get_size(ctx, 0);
+    llama_pos kv_pos = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+
+    // time info
+    double elapsed_ms = elapsed_ns / 1e6;
+    double tokens_per_sec = elapsed_ms > 0 ? n_tokens / (elapsed_ms / 1000.0) : 0.0;
+
+    fprintf(stderr, "\n  %s: State: %.2f MB | KV: %.2f MB (%d pos) | Time: %.2f ms | %.2f tokens/s\n",
+        phase, (double)state_bytes / (1024.0 * 1024.0), (double)kv_bytes / (1024.0 * 1024.0),
+        (int)kv_pos, elapsed_ms, tokens_per_sec);
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     // try to set locale for unicode characters in markdown
@@ -2383,8 +2402,13 @@ int main(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: prompt run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
+                uint64_t t_pp_start = get_time_ns();
                 bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
+                uint64_t t_pp_ns = get_time_ns() - t_pp_start;
+
                 global_papi_state.print_metrics_and_clean(std::string("Prefill"));
+                print_phase_memory_and_time(ctx, "Prefill", t_pp_ns, t.n_prompt);
+
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt\n", __func__);
                     llama_free(ctx);
@@ -2397,8 +2421,13 @@ int main(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: generation run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
+                uint64_t t_tg_start = get_time_ns();
                 bool res = test_gen(ctx, t.n_gen, t.n_threads);
+                uint64_t t_tg_ns = get_time_ns() - t_tg_start;
+
                 global_papi_state.print_metrics_and_clean(std::string("Decode"));
+                print_phase_memory_and_time(ctx, "Decode", t_tg_ns, t.n_gen);
+
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run gen\n", __func__);
                     llama_free(ctx);
