@@ -1,0 +1,5 @@
+# bench-sweep/.gitignore
+# Ignore everything except sweep.py and config.yaml
+*
+!.gitignore
+!sweep.py
