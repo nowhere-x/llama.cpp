@@ -463,6 +463,28 @@ def run_depth_sweep(cfg, models, results_dir, logs_dir, dry_run, purge):
             count += 1
     return count
 
+def run_decode_sweep(cfg, models, results_dir, logs_dir, dry_run, purge):
+    phase = cfg["phases"]["decode_sweep"]
+    if not phase.get("enabled"):
+        return 0
+    
+    if not dry_run and purge:
+        purge_phase_from_csvs(results_dir, "decode_sweep")
+
+    count = 0
+    print("\n== Phase: decode_sweep ==")
+    for gval in phase["n_gen"]:
+        for mkey, mcfg in models.items():
+            run_bench(
+                cfg["llama_bench"], mcfg,
+                {"phase": "decode_sweep", "n_prompt": phase["n_prompt"], "n_gen": gval,
+                 "n_threads": mcfg["threads"], "reps": mcfg.get("reps", cfg["default_reps"]),
+                 "cooldown_s": cfg.get("cooldown_s", 0),
+                 "extra_args": phase.get("extra_args", [])},
+                cfg.get("resource_monitor", {}), results_dir, logs_dir, dry_run,
+            )
+            count += 1
+    return count
 
 def run_thread_sweep(cfg, models, results_dir, logs_dir, dry_run, purge):
     phase = cfg["phases"]["thread_sweep"]
@@ -493,7 +515,7 @@ def main():
     parser = argparse.ArgumentParser(description="llama-bench profiling sweep")
     parser.add_argument("-c", "--config", default="bench-sweep/config.yaml",
                         help="Path to config YAML (default: bench-sweep/config.yaml)")
-    parser.add_argument("--phase", choices=["prompt", "depth", "thread", "all"], default="all")
+    parser.add_argument("--phase", choices=["prompt", "depth", "decode", "thread", "all"], default="all")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without running")
     parser.add_argument("--purge", action="store_true", help="Purge existing results for the selected phase before running new benchmarks")
     args = parser.parse_args()
@@ -512,8 +534,9 @@ def main():
     phase_map = {
         "prompt": [run_prompt_sweep],
         "depth":  [run_depth_sweep],
+        "decode": [run_decode_sweep],
         "thread": [run_thread_sweep],
-        "all":    [run_prompt_sweep, run_depth_sweep, run_thread_sweep],
+        "all":    [run_prompt_sweep, run_depth_sweep, run_decode_sweep, run_thread_sweep],
     }
 
     for runner in phase_map[args.phase]:
