@@ -68,12 +68,12 @@ class ResourceMonitor:
         if self._thread:
             self._thread.join(timeout=2)
 
-    def energy_uj(self):
+    def energy_j(self):
         if self.energy_start_uj is not None and self.energy_end_uj is not None:
             delta = self.energy_end_uj - self.energy_start_uj
             if delta < 0:  # counter wrapped
-                delta += 2**32
-            return delta
+                delta += 2**64
+            return round(delta / 1e6, 3)  # convert to joules
         return None
 
 
@@ -199,7 +199,7 @@ FINE_BY_WEIGHT_FIELDS = [
 ]
 RESOURCE_FIELDS = [
     "phase", "model", "n_prompt", "n_gen", "n_depth", "n_threads",
-    "rss_peak_kb", "temp_max_c", "energy_uj",
+    "rss_peak_kb", "temp_max_c", "energy_j",
 ]
 
 
@@ -369,7 +369,7 @@ def run_bench(llama_bench, model_cfg, run_meta, rmon_cfg, results_dir, logs_dir,
             **common,
             "rss_peak_kb": mon.rss_peak_kb,
             "temp_max_c": f"{mon.temp_max_c:.1f}",
-            "energy_uj": mon.energy_uj() or "",
+            "energy_j": mon.energy_j() or "",
         }])
 
     print(f"  OK ({len(coarse_records)} coarse, {len(fine_records)} fine-raw records)")
