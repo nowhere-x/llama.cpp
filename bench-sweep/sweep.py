@@ -216,6 +216,39 @@ def append_csv(path, fields, rows):
         for row in rows:
             w.writerow({k: row.get(k, "") for k in fields})
 
+def purge_phase_from_csvs(results_dir, phase_name):
+
+    target_files = [
+        "coarse.csv", 
+        "fine_raw.csv", 
+        "fine_by_op.csv", 
+        "fine_by_weight.csv", 
+        "resource.csv"
+    ]
+    
+    for filename in target_files:
+        filepath = results_dir / filename
+        if not filepath.exists():
+            continue
+            
+        retained_rows = []
+        fieldnames = []
+        
+        with open(filepath, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames
+            if not fieldnames:
+                continue
+                
+            for row in reader:
+                if row.get("phase") != phase_name:
+                    retained_rows.append(row)
+                    
+        with open(filepath, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(retained_rows)
+
 
 # ── Aggregation helpers ──────────────────────────────────────
 # Extract op type: first word of kernel name (e.g. "MUL_MAT", "SOFT_MAX", "ROPE")
@@ -382,10 +415,14 @@ def run_bench(llama_bench, model_cfg, run_meta, rmon_cfg, results_dir, logs_dir,
 
 
 # ── Phase runners ────────────────────────────────────────────
-def run_prompt_sweep(cfg, models, results_dir, logs_dir, dry_run):
+def run_prompt_sweep(cfg, models, results_dir, logs_dir, dry_run, purge):
     phase = cfg["phases"]["prompt_sweep"]
     if not phase.get("enabled"):
         return 0
+    
+    if not dry_run and purge:
+        purge_phase_from_csvs(results_dir, "prompt_sweep")
+
     count = 0
     print("\n== Phase: prompt_sweep ==")
     for pval in phase["n_prompt"]:
@@ -402,10 +439,14 @@ def run_prompt_sweep(cfg, models, results_dir, logs_dir, dry_run):
     return count
 
 
-def run_depth_sweep(cfg, models, results_dir, logs_dir, dry_run):
+def run_depth_sweep(cfg, models, results_dir, logs_dir, dry_run, purge):
     phase = cfg["phases"]["depth_sweep"]
     if not phase.get("enabled"):
         return 0
+
+    if not dry_run and purge:
+        purge_phase_from_csvs(results_dir, "depth_sweep")
+
     count = 0
     print("\n== Phase: depth_sweep ==")
     for dval in phase["n_depth"]:
@@ -423,10 +464,14 @@ def run_depth_sweep(cfg, models, results_dir, logs_dir, dry_run):
     return count
 
 
-def run_thread_sweep(cfg, models, results_dir, logs_dir, dry_run):
+def run_thread_sweep(cfg, models, results_dir, logs_dir, dry_run, purge):
     phase = cfg["phases"]["thread_sweep"]
     if not phase.get("enabled"):
         return 0
+    
+    if not dry_run and purge:
+        purge_phase_from_csvs(results_dir, "thread_sweep")
+
     count = 0
     print("\n== Phase: thread_sweep ==")
     for tval in phase["threads"]:
@@ -450,6 +495,7 @@ def main():
                         help="Path to config YAML (default: bench-sweep/config.yaml)")
     parser.add_argument("--phase", choices=["prompt", "depth", "thread", "all"], default="all")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without running")
+    parser.add_argument("--purge", action="store_true", help="Purge existing results for the selected phase before running new benchmarks")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -471,7 +517,7 @@ def main():
     }
 
     for runner in phase_map[args.phase]:
-        total += runner(cfg, models, results_dir, logs_dir, args.dry_run)
+        total += runner(cfg, models, results_dir, logs_dir, args.dry_run, args.purge)
 
     print(f"\nDone. {total} runs {'(dry-run)' if args.dry_run else 'completed'}.")
     if not args.dry_run:
