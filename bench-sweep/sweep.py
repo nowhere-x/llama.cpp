@@ -11,6 +11,11 @@ from pathlib import Path
 
 import yaml
 
+def read_int(path):
+    try:
+        return int(Path(path).read_text().strip())
+    except (OSError, ValueError):
+        return None
 
 # ── Resource Monitor ─────────────────────────────────────────
 class ResourceMonitor:
@@ -28,17 +33,14 @@ class ResourceMonitor:
         self.temp_max_c = 0.0
         self.energy_start_uj = None
         self.energy_end_uj = None
+        max_val = read_int(cfg.get("rapl_max_path"))
+        self.max_uj = 65_532_610_987 if max_val is None else max_val + 1
 
-    def _read_int(self, path):
-        try:
-            return int(Path(path).read_text().strip())
-        except (OSError, ValueError):
-            return None
 
     def _poll(self):
         # snapshot RAPL start
         if self.rapl_path:
-            self.energy_start_uj = self._read_int(self.rapl_path)
+            self.energy_start_uj = read_int(self.rapl_path)
         while not self._stop.is_set():
             # RSS from /proc/pid/status VmHWM
             try:
@@ -51,13 +53,13 @@ class ResourceMonitor:
                 pass
             # Temperature
             if self.temp_path:
-                val = self._read_int(self.temp_path)
+                val = read_int(self.temp_path)
                 if val is not None:
                     self.temp_max_c = max(self.temp_max_c, val / 1000.0)
             self._stop.wait(self.poll_interval)
         # snapshot RAPL end
         if self.rapl_path:
-            self.energy_end_uj = self._read_int(self.rapl_path)
+            self.energy_end_uj = read_int(self.rapl_path)
 
     def start(self):
         self._thread = threading.Thread(target=self._poll, daemon=True)
@@ -72,7 +74,7 @@ class ResourceMonitor:
         if self.energy_start_uj is not None and self.energy_end_uj is not None:
             delta = self.energy_end_uj - self.energy_start_uj
             if delta < 0:  # counter wrapped
-                delta += 2**64
+                delta += self.max_uj
             return round(delta / 1e6, 3)  # convert to joules
         return None
 
