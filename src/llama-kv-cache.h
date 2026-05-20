@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
+#include "llama-snapkv.h"
 
 #include <unordered_map>
 #include <vector>
@@ -19,6 +20,8 @@ struct llama_context;
 
 class llama_kv_cache : public llama_memory_i {
 public:
+    friend class llama_kv_cache_context;
+
     struct stream_copy_info {
         bool empty() const {
             assert(ssrc.size() == sdst.size());
@@ -168,6 +171,7 @@ public:
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+    ggml_tensor * cpy_q(ggml_context * ctx, ggml_tensor * q_cur, ggml_tensor * q_idxs, int32_t il, const slot_info & sinfo) const;
 
     //
     // preparation API
@@ -217,9 +221,11 @@ private:
         // note: can be different from the layer index in the KV cache
         uint32_t il;
 
+        ggml_tensor * q;
         ggml_tensor * k;
         ggml_tensor * v;
 
+        std::vector<ggml_tensor *> q_stream;
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
     };
@@ -249,6 +255,10 @@ private:
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
+
+    llama_snapkv_params snapkv_params;
+    bool snapkv_pending = false;
+    llama_seq_id snapkv_pending_seq = -1;
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
@@ -293,6 +303,17 @@ private:
                llm_graph_result * res,
                   llama_context * lctx) const;
 
+    ggml_cgraph * build_graph_snapkv_select(
+               llm_graph_result * res,
+                    uint32_t      il,
+        const std::vector<int32_t> & prefix_rows,
+        const std::vector<int32_t> & obs_rows,
+              ggml_tensor ** selected_prefix) const;
+
+    ggml_cgraph * build_graph_snapkv_rewrite(
+               llm_graph_result * res,
+        const std::vector<int32_t> & src_rows) const;
+
     struct cell_ranges_t {
         uint32_t strm;
 
@@ -304,6 +325,11 @@ private:
 
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
+
+    void snapkv_reset_pending();
+    uint32_t snapkv_count_seq_cells(llama_seq_id seq_id) const;
+    void snapkv_maybe_schedule(const llama_ubatch & ubatch, size_t ubatch_index, size_t n_ubatches);
+    bool snapkv_apply(llama_context * lctx);
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {
@@ -365,6 +391,7 @@ public:
     //   - v_idxs [n_tokens] or [n_tokens*n_embd_v_gqa] depending if V cache is transposed
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
+    ggml_tensor * cpy_q(ggml_context * ctx, ggml_tensor * q_cur, ggml_tensor * q_idxs, int32_t il) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but

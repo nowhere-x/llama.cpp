@@ -2130,6 +2130,9 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
+        if (auto * q_cpy = mctx_cur->cpy_q(ctx0, q_cur, k_idxs, il)) {
+            ggml_build_forward_expand(gf, q_cpy);
+        }
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
