@@ -1919,7 +1919,7 @@ void llm_graph_input_k_shift::set_input(const llama_ubatch * ubatch) {
 
 ggml_cgraph * llama_kv_cache::build_graph_snapkv_select(
         llm_graph_result * res,
-             uint32_t      il,
+        const std::vector<std::pair<uint32_t, float>> & score_layers,
         const std::vector<int32_t> & prefix_rows,
     const std::vector<int32_t> & obs_rows,
           ggml_tensor ** selected_prefix) const {
@@ -1928,9 +1928,7 @@ ggml_cgraph * llama_kv_cache::build_graph_snapkv_select(
 
     GGML_ASSERT(!prefix_rows.empty());
     GGML_ASSERT(!obs_rows.empty());
-
-    const int32_t ikv = map_layer_ids.at(il);
-    const auto & layer = layers[ikv];
+    GGML_ASSERT(!score_layers.empty());
 
     auto inp = std::make_unique<llm_graph_input_snapkv_select>(prefix_rows, obs_rows);
 
@@ -1939,39 +1937,50 @@ ggml_cgraph * llama_kv_cache::build_graph_snapkv_select(
     ggml_set_input(inp->prefix_rows);
     ggml_set_input(inp->obs_rows);
 
-    ggml_tensor * q_obs = ggml_get_rows(ctx, layer.q_stream[0], inp->obs_rows);
-    ggml_tensor * k_prefix = ggml_get_rows(ctx, layer.k_stream[0], inp->prefix_rows);
-
-    const int64_t obs_len = obs_rows.size();
+    const int64_t obs_len    = obs_rows.size();
     const int64_t prefix_len = prefix_rows.size();
-    const int64_t n_head = hparams.n_head(il);
-    const int64_t n_head_kv = hparams.n_head_kv(il);
-    const int64_t n_gqa = hparams.n_gqa(il);
-    const int64_t n_embd_head_k = hparams.n_embd_head_k(il);
-
-    q_obs = ggml_reshape_3d(ctx, q_obs, n_embd_head_k, n_head, obs_len);
-    k_prefix = ggml_reshape_3d(ctx, k_prefix, n_embd_head_k, n_head_kv, prefix_len);
 
     ggml_tensor * total_scores = nullptr;
-    const float scale = 1.0f/std::sqrt(float(n_embd_head_k));
 
-    for (int64_t head = 0; head < n_head; ++head) {
-        const int64_t kv_head = head / n_gqa;
+    for (const auto & [model_il, weight] : score_layers) {
+        const int32_t ikv = map_layer_ids.at((int32_t) model_il);
+        const auto & layer = layers[ikv];
 
-        ggml_tensor * q_head = ggml_view_2d(ctx, q_obs,
-                n_embd_head_k, obs_len,
-                q_obs->nb[2], head*q_obs->nb[1]);
+        const int64_t n_head        = hparams.n_head(model_il);
+        const int64_t n_head_kv     = hparams.n_head_kv(model_il);
+        const int64_t n_gqa         = hparams.n_gqa(model_il);
+        const int64_t n_embd_head_k = hparams.n_embd_head_k(model_il);
 
-        ggml_tensor * k_head = ggml_view_2d(ctx, k_prefix,
-                n_embd_head_k, prefix_len,
-                k_prefix->nb[2], kv_head*k_prefix->nb[1]);
+        ggml_tensor * q_obs    = ggml_get_rows(ctx, layer.q_stream[0], inp->obs_rows);
+        ggml_tensor * k_prefix = ggml_get_rows(ctx, layer.k_stream[0], inp->prefix_rows);
 
-        ggml_tensor * logits = ggml_mul_mat(ctx, k_head, q_head);
-        ggml_tensor * probs = ggml_soft_max_ext(ctx, logits, nullptr, scale, 0.0f);
-        ggml_tensor * probs_t = ggml_cont(ctx, ggml_transpose(ctx, probs));
-        ggml_tensor * head_scores = ggml_sum_rows(ctx, probs_t);
+        q_obs    = ggml_reshape_3d(ctx, q_obs,    n_embd_head_k, n_head,    obs_len);
+        k_prefix = ggml_reshape_3d(ctx, k_prefix, n_embd_head_k, n_head_kv, prefix_len);
 
-        total_scores = total_scores == nullptr ? head_scores : ggml_add(ctx, total_scores, head_scores);
+        const float scale = 1.0f/std::sqrt(float(n_embd_head_k));
+
+        ggml_tensor * layer_scores = nullptr;
+        for (int64_t head = 0; head < n_head; ++head) {
+            const int64_t kv_head = head / n_gqa;
+
+            ggml_tensor * q_head = ggml_view_2d(ctx, q_obs,
+                    n_embd_head_k, obs_len,
+                    q_obs->nb[2], head*q_obs->nb[1]);
+
+            ggml_tensor * k_head = ggml_view_2d(ctx, k_prefix,
+                    n_embd_head_k, prefix_len,
+                    k_prefix->nb[2], kv_head*k_prefix->nb[1]);
+
+            ggml_tensor * logits = ggml_mul_mat(ctx, k_head, q_head);
+            ggml_tensor * probs = ggml_soft_max_ext(ctx, logits, nullptr, scale, 0.0f);
+            ggml_tensor * probs_t = ggml_cont(ctx, ggml_transpose(ctx, probs));
+            ggml_tensor * head_scores = ggml_sum_rows(ctx, probs_t);
+
+            layer_scores = layer_scores == nullptr ? head_scores : ggml_add(ctx, layer_scores, head_scores);
+        }
+
+        ggml_tensor * weighted = ggml_scale(ctx, layer_scores, weight);
+        total_scores = total_scores == nullptr ? weighted : ggml_add(ctx, total_scores, weighted);
     }
 
     ggml_tensor * scores = ggml_transpose(ctx, total_scores);
@@ -1981,7 +1990,10 @@ ggml_cgraph * llama_kv_cache::build_graph_snapkv_select(
         scores = ggml_pool_1d(ctx, scores, GGML_OP_POOL_AVG, kernel, 1, kernel/2);
     }
 
-    ggml_tensor * selected = ggml_argsort_top_k(ctx, scores, snapkv_params.max_capacity - snapkv_params.window_size);
+    const uint32_t sink_len   = std::min<uint32_t>(snapkv_params.sink_size, (uint32_t) (prefix_len + obs_len));
+    const uint32_t top_k_keep = snapkv_params.max_capacity - snapkv_params.window_size - sink_len;
+
+    ggml_tensor * selected = ggml_argsort_top_k(ctx, scores, top_k_keep);
     ggml_build_forward_expand(gf, selected);
 
     if (selected_prefix != nullptr) {
@@ -2640,25 +2652,27 @@ bool llama_kv_cache::snapkv_apply(llama_context * lctx) {
 
     auto & cells = v_cells[seq_to_stream[snapkv_pending_seq]];
     const uint32_t n_before = snapkv_count_seq_cells(snapkv_pending_seq);
+    std::vector<int32_t> sink_rows;
     std::vector<int32_t> prefix_rows;
     std::vector<int32_t> obs_rows;
 
-    if (!llama_snapkv_build_row_sets(snapkv_params, snapkv_pending_seq, cells, prefix_rows, obs_rows)) {
+    if (!llama_snapkv_build_row_sets(snapkv_params, snapkv_pending_seq, cells, sink_rows, prefix_rows, obs_rows)) {
         snapkv_reset_pending();
         return false;
     }
 
-    const auto * source_layer = [&]() -> const kv_layer * {
-        for (const auto & layer : layers) {
-            if (layer.q != nullptr && layer.v != nullptr && llama_snapkv_is_supported_type(layer.k->type)) {
-                return &layer;
-            }
+    // Collect layers eligible for SnapKV scoring (have q/v and supported K dtype).
+    std::vector<uint32_t> eligible_il;
+    eligible_il.reserve(layers.size());
+    for (const auto & layer : layers) {
+        if (layer.q != nullptr && layer.v != nullptr && llama_snapkv_is_supported_type(layer.k->type)) {
+            eligible_il.push_back(layer.il);
         }
+    }
+    std::sort(eligible_il.begin(), eligible_il.end());
 
-        return nullptr;
-    }();
-
-    if (source_layer == nullptr) {
+    const auto score_layers = llama_snapkv_score_schedule(snapkv_params, eligible_il);
+    if (score_layers.empty()) {
         snapkv_reset_pending();
         return false;
     }
@@ -2672,7 +2686,7 @@ bool llama_kv_cache::snapkv_apply(llama_context * lctx) {
     res->reset();
 
     ggml_tensor * selected_prefix_tensor = nullptr;
-    ggml_cgraph * gf = build_graph_snapkv_select(res, source_layer->il, prefix_rows, obs_rows, &selected_prefix_tensor);
+    ggml_cgraph * gf = build_graph_snapkv_select(res, score_layers, prefix_rows, obs_rows, &selected_prefix_tensor);
     if (!ggml_backend_sched_alloc_graph(sched, gf)) {
         LLAMA_LOG_ERROR("%s: failed to allocate SnapKV selection graph\n", __func__);
         snapkv_reset_pending();
@@ -2687,7 +2701,8 @@ bool llama_kv_cache::snapkv_apply(llama_context * lctx) {
         return false;
     }
 
-    std::vector<int32_t> selected_prefix(snapkv_params.max_capacity - snapkv_params.window_size);
+    const uint32_t sink_len = (uint32_t) sink_rows.size();
+    std::vector<int32_t> selected_prefix(snapkv_params.max_capacity - snapkv_params.window_size - sink_len);
     ggml_backend_tensor_get(selected_prefix_tensor, selected_prefix.data(), 0, selected_prefix.size()*sizeof(int32_t));
 
     llama_snapkv_plan plan;

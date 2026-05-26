@@ -305,7 +305,7 @@ private:
 
     ggml_cgraph * build_graph_snapkv_select(
                llm_graph_result * res,
-                    uint32_t      il,
+        const std::vector<std::pair<uint32_t, float>> & score_layers,
         const std::vector<int32_t> & prefix_rows,
         const std::vector<int32_t> & obs_rows,
               ggml_tensor ** selected_prefix) const;
